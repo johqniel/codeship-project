@@ -1,11 +1,20 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import hsv_to_rgb
+from PIL import Image
+
+FRAMES = 100
+GIF_RES = 600                     # lower than RES to keep 100 frames fast
+VIEW = 4.0                        # fixed view, so the disk grows out of frame as curvature -> 0
+
 
 CURVATURE = -0.472135955          # pentagonal tiling of the hyperbolic plane
 N, RADIUS, PHASE = 5, 1.0, np.pi * 1.25
 RES = 1200
 MAX_PERIOD = 200                  # iterations tracked for return time
+
+def smooth(t):
+    return t * t * (3 - 2 * t)
 
 
 def regular_ngon(n, radius, phase):
@@ -79,11 +88,15 @@ def period_map(verts, c, res, extent, max_period):
 
 
 if __name__ == "__main__":
-    verts = regular_ngon(N, RADIUS, PHASE)
-    extent = 2.0 / np.sqrt(-CURVATURE) * 1.02          # just outside the Poincare disk
-    img = period_map(verts, CURVATURE, RES, extent, MAX_PERIOD)
-    plt.figure(figsize=(8, 8))
-    plt.imshow(img, extent=[-extent, extent, -extent, extent])
-    plt.axis("off")
-    plt.savefig("hyperbolic_billiards.png", dpi=200, bbox_inches="tight", facecolor="black")
-    plt.show()
+    frames = []
+    for f in range(FRAMES):
+        t = smooth(f / (FRAMES - 1))
+        radius = RADIUS + (3.0 - RADIUS) * t
+        c = -np.exp(np.log(0.472135955) * (1 - t) + np.log(0.01) * t)
+        verts = regular_ngon(N, radius, PHASE)
+        img = period_map(verts, c, GIF_RES, VIEW, MAX_PERIOD)
+        frames.append(Image.fromarray((img * 255).astype(np.uint8)))
+        print(f"frame {f + 1}/{FRAMES}")
+    frames[0].save("hyperbolic_billiards.gif", save_all=True, append_images=frames[1:],
+                   duration=50, loop=0)
+                   
