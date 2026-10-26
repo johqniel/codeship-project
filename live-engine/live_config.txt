@@ -1,0 +1,21 @@
+# live-engine runtime config (edited while app runs)
+flow_depth=40
+resolution_mode=3
+view_half_width=7.0
+center_x=0.0
+center_y=0.0
+hyperbolic_enabled=1
+curvature=-0.472135955
+table_opacity=1
+island_opacity=0
+singularity_opacity=0
+singularity_depth=400
+singularity_rainbow=0
+periodicity_or_flow=0
+cycle_highlight=0
+cycle_highlight_enable=0
+show_debug_handles=0
+idle_jitter_enabled=1
+idle_jitter_start_delay_sec=3.0
+idle_drift_speed=0.0008
+idle_turn_jitter=0.000001

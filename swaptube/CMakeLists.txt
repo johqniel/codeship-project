@@ -14,11 +14,22 @@ set(ENV{GLIBCXX_FORCE_NEW} 1)
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFMPEG REQUIRED libswscale libavcodec libavformat libavdevice libavutil libavfilter)
-pkg_check_modules(GLIB REQUIRED glib-2.0)
+pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET libswscale libavcodec libavformat libavdevice libavutil libavfilter)
+pkg_check_modules(GLIB REQUIRED IMPORTED_TARGET glib-2.0)
+pkg_check_modules(GDK_PIXBUF REQUIRED IMPORTED_TARGET gdk-pixbuf-2.0)
+pkg_check_modules(CAIRO REQUIRED IMPORTED_TARGET cairo)
 find_package(Cairo REQUIRED)
 find_package(RSVG REQUIRED)
 find_package(PNG REQUIRED)
+
+# Some distributions expose RSVG include dirs as <prefix>/include/librsvg-2.0,
+# while source files include <librsvg-2.0/librsvg/rsvg.h>. Add parent include roots too.
+set(RSVG_PARENT_INCLUDE_DIRS "")
+foreach(rsvg_inc ${RSVG_INCLUDE_DIRS})
+    get_filename_component(rsvg_parent ${rsvg_inc} DIRECTORY)
+    list(APPEND RSVG_PARENT_INCLUDE_DIRS ${rsvg_parent})
+endforeach()
+list(REMOVE_DUPLICATES RSVG_PARENT_INCLUDE_DIRS)
 
 set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CMAKE_COMMAND} -E time")
 set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK "${CMAKE_COMMAND} -E time")
@@ -110,21 +121,24 @@ message(STATUS "Executable target ${PROJECT_NAME} added")
 
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${PROJECT_NAME}
-    ${FFMPEG_INCLUDE_DIRS} ${RSVG_INCLUDE_DIRS} ${GLIB_INCLUDE_DIRS}
-    "/usr/include/gdk-pixbuf-2.0"
-    "/usr/include/cairo"
+    ${FFMPEG_INCLUDE_DIRS}
+    ${RSVG_INCLUDE_DIRS}
+    ${RSVG_PARENT_INCLUDE_DIRS}
+    ${GLIB_INCLUDE_DIRS}
+    ${GDK_PIXBUF_INCLUDE_DIRS}
+    ${CAIRO_INCLUDE_DIRS}
+    ${Cairo_INCLUDE_DIRS}
     ${PNG_INCLUDE_DIR}
 )
 
 target_link_libraries(
     ${PROJECT_NAME}
-    ${GLIB_LIBRARIES}
-    ${FFMPEG_LIBRARIES}
+    PkgConfig::GLIB
+    PkgConfig::GDK_PIXBUF
+    PkgConfig::CAIRO
+    PkgConfig::FFMPEG
     ${RSVG_LIBRARIES}
     ${FDKAAC_LIBRARIES}
-    cairo
-    gobject-2.0
-    lzma
     ${PNG_LIBRARIES}
     ${GPU_LIBRARIES}
     ${X11_LIBRARIES}

@@ -1,7 +1,13 @@
-cmake_minimum_required(VERSION 3.28.3)
-project(CheckHIP HIP)
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/result.cmake"
-  "set(CMAKE_HIP_COMPILER \"${CMAKE_HIP_COMPILER}\")\n"
-  "set(CMAKE_HIP_HOST_COMPILER \"${CMAKE_HIP_HOST_COMPILER}\")\n"
-  "set(CMAKE_HIP_PLATFORM \"${CMAKE_HIP_PLATFORM}\")\n"
-  )
+cmake_minimum_required(VERSION 4.1.2)
+set(CMAKE_MODULE_PATH "/home/admin/Desktop/DanielNogues/codeship-project/swaptube/cmake")
+set(_CMAKE_CHECK_ENABLED_LANGUAGES "CXX")
+set(CMAKE_CXX_COMPILER "/nix/store/qd70v8g0561vm8m33kmnp79z00cgyi5n-gcc-wrapper-15.2.0/bin/c++")
+set(CMAKE_CXX_COMPILER_ID "GNU")
+set(CMAKE_CXX_COMPILER_LOADED 1)
+set(CMAKE_CXX_COMPILER_VERSION "15.2.0")
+
+project(CheckHIP LANGUAGES HIP)
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/result.cmake" "set(CMAKE_HIP_COMPILER \"${CMAKE_HIP_COMPILER}\")
+set(CMAKE_HIP_HOST_COMPILER \"${CMAKE_HIP_HOST_COMPILER}\")
+set(CMAKE_HIP_PLATFORM \"${CMAKE_HIP_PLATFORM}\")
+")

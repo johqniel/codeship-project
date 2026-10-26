@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 clear
 check_command_available() {
@@ -14,8 +14,10 @@ check_command_available() {
 check_command_available "cmake"
 check_command_available "ninja"
 check_command_available "gnuplot"
-# Check if MicroTeX build exists
-if [ ! -s "../MicroTeX-master/build/LaTeX" ]; then
+# Check if MicroTeX build exists unless explicitly disabled.
+if [ "${SWAPTUBE_SKIP_MICROTEX:-0}" = "1" ]; then
+    echo "go.sh: SWAPTUBE_SKIP_MICROTEX=1, skipping MicroTeX check."
+elif [ ! -s "../MicroTeX-master/build/LaTeX" ]; then
     echo "Error: ../MicroTeX-master/build/LaTeX does not exist. MicroTeX is required for this project."
     echo "Install instructions are available at https://github.com/NanoMichael/MicroTeX"
 
