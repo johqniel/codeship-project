@@ -16,6 +16,7 @@
 #include <string>
 #include <thread>
 #include <random>
+#include <regex>
 #include <unordered_map>
 #include <vector>
 
@@ -464,128 +465,231 @@ static double zoom_to_view_half_width(const AppState& st, double zoom_value) {
     return std::max(1e-6, 0.1 * aspect * std::exp(zoom_value));
 }
 
+enum class SequenceActionKind {
+    SetScalar,
+    TransitionScalar,
+    SetPolygon,
+    TransitionPolygon,
+};
+
+struct SequenceAction {
+    SequenceActionKind kind;
+    double at_sec = 0.0;
+    double duration_sec = 0.0;
+    std::string key;
+    double value = 0.0;
+    int n = 0;
+    double radius = 0.0;
+    double phase = 0.0;
+};
+
+static bool parse_double_safe(const std::string& s, double& out) {
+    try {
+        size_t idx = 0;
+        out = std::stod(s, &idx);
+        return idx == s.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+static bool parse_simple_product_expr(const std::string& expr, double& out) {
+    const std::string t = trim(expr);
+    double v = 0.0;
+    if (parse_double_safe(t, v)) {
+        out = v;
+        return true;
+    }
+
+    const std::regex mul_re(R"(^\s*([-+0-9.eE]+)\s*\*\s*([-+0-9.eE]+)\s*$)");
+    std::smatch m;
+    if (std::regex_match(t, m, mul_re) && m.size() == 3) {
+        double a = 0.0, b = 0.0;
+        if (parse_double_safe(m[1].str(), a) && parse_double_safe(m[2].str(), b)) {
+            out = a * b;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool set_state_scalar_by_key(AppState& st, const std::string& key, double v) {
+    if (key == "curvature") { st.curvature = std::clamp(v, -2.0, -1e-7); st.hyperbolic_enabled = true; return true; }
+    if (key == "zoom") { st.view_half_width = zoom_to_view_half_width(st, v); return true; }
+    if (key == "island_opacity") { st.island_opacity = std::clamp(v, 0.0, 1.0); return true; }
+    if (key == "singularity_opacity") { st.singularity_opacity = std::clamp(v, 0.0, 1.0); return true; }
+    if (key == "singularity_depth") { st.singularity_depth = std::clamp(v, 0.0, 1e9); return true; }
+    if (key == "flow_depth") { st.flow_depth = std::clamp(static_cast<int>(std::round(v)), 1, 1000000); return true; }
+    if (key == "periodicity_or_flow") { st.periodicity_or_flow = std::clamp(v, 0.0, 1.0); return true; }
+    if (key == "center_x") { st.center_x = std::clamp(v, -1e6, 1e6); return true; }
+    if (key == "center_y") { st.center_y = std::clamp(v, -1e6, 1e6); return true; }
+    if (key == "ball_opacity") { return true; }
+    if (key == "path_opacity") { return true; }
+    return false;
+}
+
+static bool get_state_scalar_by_key(const AppState& st, const std::string& key, double& out) {
+    if (key == "curvature") { out = st.curvature; return true; }
+    if (key == "zoom") {
+        const double aspect = static_cast<double>(st.width) / std::max(1, st.height);
+        out = std::log(std::max(1e-9, st.view_half_width / (0.1 * aspect)));
+        return true;
+    }
+    if (key == "island_opacity") { out = st.island_opacity; return true; }
+    if (key == "singularity_opacity") { out = st.singularity_opacity; return true; }
+    if (key == "singularity_depth") { out = st.singularity_depth; return true; }
+    if (key == "flow_depth") { out = static_cast<double>(st.flow_depth); return true; }
+    if (key == "periodicity_or_flow") { out = st.periodicity_or_flow; return true; }
+    if (key == "center_x") { out = st.center_x; return true; }
+    if (key == "center_y") { out = st.center_y; return true; }
+    if (key == "ball_opacity") { out = 0.0; return true; }
+    if (key == "path_opacity") { out = 0.0; return true; }
+    return false;
+}
+
+static std::vector<SequenceAction> load_billiards_excerpt_actions() {
+    const std::string path = "../swaptube/src/Projects/Billiards.cpp";
+    std::ifstream in(path);
+    if (!in) return {};
+
+    std::vector<SequenceAction> actions;
+    bool in_excerpt = false;
+    double t = 0.0;
+
+    const std::regex silence_re(R"(SilenceBlock\(([-+0-9.eE]+)\))");
+    const std::regex trans_scalar_re(R"(obs->manager\.transition\((MICRO|MACRO),\s*"([A-Za-z0-9_\.]+)",\s*"([^"]+)"\))");
+    const std::regex set_scalar_re(R"(obs->manager\.set\("([A-Za-z0-9_\.]+)",\s*"([^"]+)"\))");
+    const std::regex trans_ngon_re(R"(obs->manager\.transition\((MICRO|MACRO),\s*regular_ngon\((\d+),\s*([^,]+),\s*([^\)]+)\)\))");
+    const std::regex set_ngon_re(R"(obs->manager\.set\(regular_ngon\((\d+),\s*([^,]+),\s*([^\)]+)\)\))");
+    const std::regex kv_pair_re(R"(\{"([A-Za-z0-9_\.]+)",\s*"([^"]+)"\})");
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (!in_excerpt) {
+            if (line.find("...to tile the hyperbolic plane?") != std::string::npos) {
+                in_excerpt = true;
+            }
+            continue;
+        }
+        if (line.find("This has been 2swap,") != std::string::npos) {
+            break;
+        }
+
+        std::smatch m;
+        if (std::regex_search(line, m, trans_ngon_re) && m.size() == 5) {
+            double radius = 0.0, phase = 0.0;
+            if (parse_simple_product_expr(m[3].str(), radius) && parse_simple_product_expr(m[4].str(), phase)) {
+                const bool micro = (m[1].str() == "MICRO");
+                actions.push_back({SequenceActionKind::TransitionPolygon, t, micro ? 1.0 : 3.0, "", 0.0, std::stoi(m[2].str()), radius, phase});
+            }
+        } else if (std::regex_search(line, m, set_ngon_re) && m.size() == 4) {
+            double radius = 0.0, phase = 0.0;
+            if (parse_simple_product_expr(m[2].str(), radius) && parse_simple_product_expr(m[3].str(), phase)) {
+                actions.push_back({SequenceActionKind::SetPolygon, t, 0.0, "", 0.0, std::stoi(m[1].str()), radius, phase});
+            }
+        } else if (std::regex_search(line, m, trans_scalar_re) && m.size() == 4) {
+            double value = 0.0;
+            if (parse_simple_product_expr(m[3].str(), value)) {
+                const bool micro = (m[1].str() == "MICRO");
+                actions.push_back({SequenceActionKind::TransitionScalar, t, micro ? 1.0 : 3.0, m[2].str(), value, 0, 0.0, 0.0});
+            }
+        } else if (std::regex_search(line, m, set_scalar_re) && m.size() == 3) {
+            double value = 0.0;
+            if (parse_simple_product_expr(m[2].str(), value)) {
+                actions.push_back({SequenceActionKind::SetScalar, t, 0.0, m[1].str(), value, 0, 0.0, 0.0});
+            }
+        } else if (line.find("obs->manager.transition(") != std::string::npos || line.find("obs->manager.set(") != std::string::npos) {
+            auto it = std::sregex_iterator(line.begin(), line.end(), kv_pair_re);
+            auto end = std::sregex_iterator();
+            const bool is_transition = line.find("obs->manager.transition(") != std::string::npos;
+            const bool micro = line.find("MICRO") != std::string::npos;
+            for (; it != end; ++it) {
+                const std::smatch& pair = *it;
+                if (pair.size() != 3) continue;
+                double value = 0.0;
+                if (!parse_simple_product_expr(pair[2].str(), value)) continue;
+                actions.push_back({
+                    is_transition ? SequenceActionKind::TransitionScalar : SequenceActionKind::SetScalar,
+                    t,
+                    is_transition ? (micro ? 1.0 : 3.0) : 0.0,
+                    pair[1].str(), value, 0, 0.0, 0.0
+                });
+            }
+        }
+
+        auto sit = std::sregex_iterator(line.begin(), line.end(), silence_re);
+        auto send = std::sregex_iterator();
+        for (; sit != send; ++sit) {
+            const std::smatch& sm = *sit;
+            if (sm.size() != 2) continue;
+            double sec = 0.0;
+            if (parse_double_safe(sm[1].str(), sec)) t += std::max(0.0, sec);
+        }
+    }
+
+    std::sort(actions.begin(), actions.end(), [](const SequenceAction& a, const SequenceAction& b) {
+        if (a.at_sec != b.at_sec) return a.at_sec < b.at_sec;
+        return static_cast<int>(a.kind) < static_cast<int>(b.kind);
+    });
+    return actions;
+}
+
 static void apply_billiards_hyperbolic_script(AppState& st, double dt_sec) {
     if (!st.hyperbolic_script_active) return;
+
+    static std::vector<SequenceAction> actions;
+    static bool actions_loaded = false;
+    static AppState base_state;
+    static bool base_state_valid = false;
+    static double last_t = -1.0;
+
+    if (!actions_loaded) {
+        actions = load_billiards_excerpt_actions();
+        actions_loaded = true;
+    }
+
     st.hyperbolic_script_time_sec += std::max(0.0, dt_sec);
-
-    const std::vector<Vec2> pentagon_r1 = regular_ngon_vertices(5, 1.0, BILLIARDS_PHASE);
-    const std::vector<Vec2> pentagon_r3 = regular_ngon_vertices(5, 3.0, BILLIARDS_PHASE);
-    const std::vector<Vec2> tri3 = regular_ngon_vertices(3, 3.0, BILLIARDS_PHASE);
-    std::vector<Vec2> hack3 = {
-        tri3[0],
-        tri3[1],
-        tri3[1],
-        tri3[2],
-        tri3[2],
-    };
-    const std::vector<Vec2> square_r3 = regular_ngon_vertices(4, 3.0, BILLIARDS_PHASE);
-    const std::vector<Vec2> square_tiny = regular_ngon_vertices(4, 0.005, BILLIARDS_PHASE);
-
     const double t = st.hyperbolic_script_time_sec;
-    st.hyperbolic_enabled = true;
 
-    if (t < 1.0) {
-        st.vertices = pentagon_r1;
-        st.curvature = BILLIARDS_K_PENTAGON;
-        st.view_half_width = zoom_to_view_half_width(st, 0.3);
-        st.island_opacity = 1.0;
-        st.singularity_opacity = 1.0;
-        st.singularity_depth = std::max(st.singularity_depth, 400.0);
-        st.periodicity_or_flow = 0.0;
+    if (!base_state_valid || t < last_t || t < 1e-9) {
+        base_state = st;
+        base_state_valid = true;
+    }
+    last_t = t;
+
+    if (actions.empty()) {
+        st.hyperbolic_script_active = false;
         return;
     }
 
-    if (t < 4.0) {
-        const double u = (t - 1.0) / 3.0;
-        st.vertices = lerp_vertices(pentagon_r1, pentagon_r3, u);
-        const double log_a = std::log(0.472135955);
-        const double log_b = std::log(0.01);
-        const double curv_mag = std::exp(log_a * (1.0 - u) + log_b * u);
-        st.curvature = -curv_mag;
-        st.view_half_width = zoom_to_view_half_width(st, 0.3 * (1.0 - u) + (-1.5) * u);
-        st.island_opacity = 1.0 - u;
-        return;
+    AppState out = base_state;
+    out.hyperbolic_enabled = true;
+
+    double seq_end = 0.0;
+    for (const SequenceAction& a : actions) {
+        seq_end = std::max(seq_end, a.at_sec + a.duration_sec);
+        if (t < a.at_sec) break;
+
+        const double p = (a.duration_sec <= 1e-9) ? 1.0 : std::clamp((t - a.at_sec) / a.duration_sec, 0.0, 1.0);
+        if (a.kind == SequenceActionKind::SetScalar) {
+            set_state_scalar_by_key(out, a.key, a.value);
+        } else if (a.kind == SequenceActionKind::TransitionScalar) {
+            double from = 0.0;
+            if (get_state_scalar_by_key(out, a.key, from)) {
+                const double v = from * (1.0 - p) + a.value * p;
+                set_state_scalar_by_key(out, a.key, v);
+            }
+        } else if (a.kind == SequenceActionKind::SetPolygon) {
+            out.vertices = regular_ngon_vertices(a.n, a.radius, a.phase);
+        } else if (a.kind == SequenceActionKind::TransitionPolygon) {
+            const std::vector<Vec2> target = regular_ngon_vertices(a.n, a.radius, a.phase);
+            out.vertices = lerp_vertices(out.vertices, target, p);
+        }
     }
 
-    if (t < 4.5) {
-        const double u = (t - 4.0) / 0.5;
-        st.vertices = pentagon_r3;
-        st.curvature = -0.01;
-        st.view_half_width = zoom_to_view_half_width(st, -1.5);
-        st.flow_depth = 1600;
-        st.island_opacity = u;
-        return;
-    }
-
-    if (t < 34.5) {
-        st.vertices = pentagon_r3;
-        st.curvature = -0.01;
-        st.view_half_width = zoom_to_view_half_width(st, -1.5);
-        st.flow_depth = 1600;
-        st.island_opacity = 1.0;
-        return;
-    }
-
-    if (t < 36.5) {
-        const double u = (t - 34.5);
-        st.vertices = lerp_vertices(pentagon_r3, hack3, u);
-        st.curvature = -0.01;
-        st.view_half_width = zoom_to_view_half_width(st, -1.5);
-        st.flow_depth = 1600;
-        st.singularity_opacity = 1.0 - u;
-        return;
-    }
-
-    if (t < 40.5) {
-        st.vertices = hack3;
-        st.curvature = -0.01;
-        st.view_half_width = zoom_to_view_half_width(st, -1.5);
-        st.flow_depth = 1600;
-        st.singularity_opacity = 0.0;
-        return;
-    }
-
-    if (t < 46.5) {
-        const double u = (t - 40.5) / 6.0;
-        st.vertices = tri3;
-        st.curvature = BILLIARDS_K_TRIOCT;
-        st.view_half_width = zoom_to_view_half_width(st, -1.5);
-        st.singularity_opacity = 0.4 * std::clamp(u, 0.0, 1.0);
-        return;
-    }
-
-    if (t < 47.5) {
-        const double u = (t - 40.5);
-        st.vertices = lerp_vertices(hack3, tri3, u);
-        st.curvature = BILLIARDS_K_TRIOCT;
-        st.view_half_width = zoom_to_view_half_width(st, -1.5);
-        st.singularity_opacity = 0.4;
-        return;
-    }
-
-    if (t < 77.5) {
-        const double u = std::clamp((t - 47.5) / 30.0, 0.0, 1.0);
-        st.vertices = lerp_vertices(tri3, square_r3, u);
-        st.curvature = BILLIARDS_K_TRIOCT;
-        st.view_half_width = zoom_to_view_half_width(st, -1.5);
-        st.singularity_opacity = 0.4;
-        return;
-    }
-
-    if (t < 81.5) {
-        const double u = (t - 77.5) / 4.0;
-        st.vertices = lerp_vertices(square_r3, square_tiny, u);
-        st.curvature = BILLIARDS_K_TRIOCT * (1.0 - u) + BILLIARDS_K_END * u;
-        st.view_half_width = zoom_to_view_half_width(st, (-1.5) * (1.0 - u) + (-2.5) * u);
-        st.singularity_opacity = 0.4 + 0.6 * u;
-        return;
-    }
-
-    st.vertices = square_tiny;
-    st.curvature = BILLIARDS_K_END;
-    st.view_half_width = zoom_to_view_half_width(st, -2.5);
-    st.singularity_opacity = 1.0;
-    st.hyperbolic_script_active = false;
+    const bool keep_active = t <= (seq_end + 0.5);
+    out.hyperbolic_script_active = keep_active;
+    st = out;
 }
 
 static void render_scene(const AppState& st, std::vector<uint32_t>& img) {
