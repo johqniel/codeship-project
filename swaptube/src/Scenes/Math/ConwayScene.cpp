@@ -1,0 +1,30 @@
+#include "ConwayScene.h"
+#include "../../Host_Device_Shared/find_roots.c"
+
+extern "C" void draw_conway(
+    Bitboard* h_board, Bitboard* h_board_2,
+    const ivec2& grid_wh_bitboards,
+    uint32_t* h_pixels, const ivec2& pix_wh,
+    const vec2& lx_ty, const vec2& rx_by, float transition
+);
+
+ConwayScene::ConwayScene(const ivec2& size_bitboards, const Pixels& env, const vec2& dimensions) : CoordinateScene(dimensions), conway_grid(size_bitboards, env) { }
+
+void ConwayScene::draw() {
+    conway_grid.iterate();
+    draw_conway(
+        conway_grid.d_board_2,
+        conway_grid.d_board,
+        conway_grid.grid_wh_bitboards,
+        gpu_pix.get_ptr(), get_width_height(),
+        vec2(state[ "left_x"], state[   "top_y"]),
+        vec2(state["right_x"], state["bottom_y"]),
+        state["microblock_fraction_passthrough"]
+    );
+    CoordinateScene::draw();
+}
+
+void ConwayScene::on_end_transition_extra_behavior(const TransitionType tt){
+    if(tt == MICRO)
+        ;//conway_grid->iterate();
+}

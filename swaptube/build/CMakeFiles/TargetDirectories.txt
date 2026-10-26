@@ -1,0 +1,3 @@
+/workspace/swaptube/build/CMakeFiles/swaptube.dir
+/workspace/swaptube/build/CMakeFiles/edit_cache.dir
+/workspace/swaptube/build/CMakeFiles/rebuild_cache.dir

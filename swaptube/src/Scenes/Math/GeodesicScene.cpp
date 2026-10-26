@@ -1,0 +1,199 @@
+#include "GeodesicScene.h"
+#include "../../IO/Writer.h"
+#include <unordered_map>
+#include <string>
+
+ResolvedStateEquation r_eq = {
+    {RESOLVED_CONSTANT, .content = {.constant = 0.0}},
+};
+ResolvedStateEquation i_eq = {
+    {RESOLVED_CONSTANT, .content = {.constant = 0.0}},
+};
+extern "C" void launch_cuda_surface_raymarch(
+    uint32_t* h_pixels, int w, int h,
+    int x_size, ResolvedStateEquationComponent* x_eq,
+    int y_size, ResolvedStateEquationComponent* y_eq,
+    int z_size, ResolvedStateEquationComponent* z_eq,
+    int w_size, ResolvedStateEquationComponent* w_eq,
+    int is_special,
+    const quat& camera_orientation, const vec3& camera_position,
+    float fov_rad, float max_dist
+);
+
+extern "C" void cuda_render_manifold(
+    uint32_t* pixels, const ivec2& wh,
+    uint32_t* distance_buffer,
+    const ManifoldData* manifolds, const int num_manifolds,
+    const vec3& camera_pos, const quat& camera_direction,
+    const float geom_mean_size, const float fov,
+    const float ab_dilation, const float dot_radius,
+    const uint32_t* tex_pixels, const int tex_w, const int tex_h
+);
+
+extern "C" void cuda_render_geodesics_2d(
+    uint32_t* pixels, const int w, const int h,
+    const ManifoldData& manifold,
+    const vec2 start_position, const vec2 start_velocity,
+    const int num_geodesics, const int num_steps, const float spread_angle,
+    const vec3 camera_pos, const quat camera_direction,
+    const float geom_mean_size, const float fov, const float opacity);
+
+GeodesicScene::GeodesicScene(const vec2& dimensions)
+    : Scene(dimensions), distance_buffer(get_width_height()) {
+    manager.set(unordered_map<string, string>{
+        {"space_x", "(a)"},
+        {"space_y", "(b)"},
+        {"space_z", "(c)"},
+        {"space_w", "0"},
+
+        {"subscreen_size", "0.5"},
+
+// Raymarching Stuff
+        {"pov_x", "0"},
+        {"pov_y", "0"},
+        {"pov_z", "0"},
+        {"pov_q1", "1"},
+        {"pov_qi", "0"},
+        {"pov_qj", "0"},
+        {"pov_qk", "0"},
+        {"pov_fov", ".5"},
+        {"pov_max_dist", "9"},
+
+//Manifold Stuff
+        {"manifold_d", "20.0"},
+        {"manifold_fov", "1.5"},
+        {"manifold_opacity", "1"},
+
+        {"geodesics_count", "1"},
+        {"geodesics_steps", "0"},
+        {"geodesics_spread_angle", "pi 2 /"},
+        {"geodesics_opacity", "1.0"},
+    });
+}
+
+void GeodesicScene::draw_perspective(ResolvedStateEquation& x_eq,
+                          ResolvedStateEquation& y_eq,
+                          ResolvedStateEquation& z_eq,
+                          ResolvedStateEquation& w_eq,
+                          const quat& camera_direction)
+{
+    vec3 camera_pos = vec3(state["pov_x"], state["pov_y"], state["pov_z"]);
+
+    bool x_y_z_flat = (
+        x_eq.size() == 1 && x_eq.data()[0].type == RESOLVED_CUDA_TAG && x_eq.data()[0].content.cuda_tag == 0 &&
+        y_eq.size() == 1 && y_eq.data()[0].type == RESOLVED_CUDA_TAG && y_eq.data()[0].content.cuda_tag == 1 &&
+        z_eq.size() == 1 && z_eq.data()[0].type == RESOLVED_CUDA_TAG && z_eq.data()[0].content.cuda_tag == 2
+    );
+    bool w_flat = w_eq.size() == 1;
+    int special_case_code = 0;
+    if(x_y_z_flat) special_case_code = 1;
+    if(x_y_z_flat && w_flat) special_case_code = 2;
+
+    launch_cuda_surface_raymarch(gpu_pix.get_ptr(), get_width(), get_height(),
+                                 x_eq.size(), x_eq.data(),
+                                 y_eq.size(), y_eq.data(),
+                                 z_eq.size(), z_eq.data(),
+                                 w_eq.size(), w_eq.data(),
+                                 special_case_code,
+                                 camera_direction, camera_pos,
+                                 state["pov_fov"], state["pov_max_dist"]);
+}
+
+void GeodesicScene::draw_manifold(
+                       ResolvedStateEquation& x_eq,
+                       ResolvedStateEquation& y_eq,
+                       ResolvedStateEquation& z_eq,
+                       ResolvedStateEquation& w_eq,
+                       const quat& fov_quat)
+{
+
+    float steps_mult = geom_mean(get_width(), get_height()) / 1500.0f;
+
+    quat yaw = normalize(quat(fov_quat.u, 0, fov_quat.j, 0));
+    double pitch_angle = 20 * M_PI / 180.0;
+    quat pitch = normalize(quat(cos(pitch_angle / 2), sin(pitch_angle / 2), 0, 0));
+    quat camera_direction = normalize(pitch * yaw);
+    vec3 camera_position = rotate_vector(vec3(0, 0, -state["manifold_d"]), conjugate(camera_direction));
+
+    camera_position.y += -2.f; // Lift the camera a bit, so it's not exactly at the same height as the manifold
+
+    ManifoldData manifold1{
+        x_eq.size(),
+        x_eq.data(),
+        w_eq.size(),
+        w_eq.data(),
+        z_eq.size(),
+        z_eq.data(),
+        r_eq.size(),
+        r_eq.data(),
+        i_eq.size(),
+        i_eq.data(),
+        -4.0f, // Should be equal to room size
+        4.0f,
+        (int)(1500 * steps_mult),
+        -4.0f,
+        4.0f,
+        (int)(1500 * steps_mult),
+    };
+
+    float mult_factor = state["subscreen_size"];
+
+    if(state["manifold_opacity"] >= 0.01f) {
+        ManifoldData manifolds[] = { manifold1 };
+        cuda_render_manifold(
+            gpu_pix.get_ptr(),
+            get_width_height(),
+            distance_buffer.get_ptr(),
+            manifolds,
+            1,
+            camera_position,
+            conjugate(camera_direction),
+            geom_mean(get_width(), get_height()),
+            state["manifold_fov"],
+            1,
+            1,
+            nullptr,0,0 // No textures
+        );
+    }
+
+    int num_geodesics = (int)state["geodesics_count"];
+    int geodesic_steps = (int)state["geodesics_steps"];
+    double geodesics_opacity = state["geodesics_opacity"];
+    if(num_geodesics > 0 && geodesic_steps > 0 && geodesics_opacity >= 0.01f) {
+        vec2 start_position = vec2(state["pov_x"], state["pov_z"]);
+        vec3 camera_dir_3d = rotate_vector(vec3(0, 0, 1), conjugate(camera_direction));
+        vec2 start_velocity = vec2(camera_dir_3d.x, camera_dir_3d.z);
+        start_velocity = 0.005 * normalize(start_velocity);
+        cuda_render_geodesics_2d(
+            gpu_pix.get_ptr(),
+            get_width(), get_height(),
+            manifold1,
+            start_position, start_velocity,
+            num_geodesics, geodesic_steps,
+            state["geodesics_spread_angle"],
+            camera_position,
+            camera_direction,
+            geom_mean(get_width(), get_height()),
+            state["manifold_fov"],
+            state["geodesics_opacity"]
+        );
+    }
+}
+
+void GeodesicScene::draw() {
+    ResolvedStateEquation x_eq = manager.get_resolved_equation("space_x");
+    ResolvedStateEquation y_eq = manager.get_resolved_equation("space_y");
+    ResolvedStateEquation z_eq = manager.get_resolved_equation("space_z");
+    ResolvedStateEquation w_eq = manager.get_resolved_equation("space_w");
+
+    quat camera_direction = normalize(quat(state["pov_q1"], state["pov_qi"], state["pov_qj"], state["pov_qk"]));
+
+    draw_perspective(x_eq, y_eq, z_eq, w_eq, camera_direction);
+
+    draw_manifold(x_eq, y_eq, z_eq, w_eq, camera_direction);
+}
+
+void GeodesicScene::change_data() {
+    Scene::change_data();
+    distance_buffer.tick(get_width_height());
+}

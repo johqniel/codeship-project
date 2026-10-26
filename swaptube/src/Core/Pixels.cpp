@@ -1,0 +1,559 @@
+#include "Pixels.h"
+
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include "../IO/Writer.h"
+
+extern "C" int cuda_bicubic_scale(const unsigned int* input_pixels, int input_w, int input_h, unsigned int* output_pixels, int output_w, int output_h);
+
+Pixels::Pixels() : wh(0,0), pixels(0) {}
+Pixels::Pixels(const ivec2& dim) : wh(dim), pixels(dim.x*dim.y) {}
+
+bool Pixels::out_of_range(int x, int y) const {
+    return x < 0 || x >= wh.x || y < 0 || y >= wh.y;
+}
+
+int Pixels::get_pixel_carelessly(int x, int y) const {
+    return pixels[wh.x*y+x];
+}
+
+int Pixels::get_pixel_carefully(int x, int y) const {
+    if(out_of_range(x, y)) return TRANSPARENT_BLACK; // 0
+    return pixels[wh.x*y+x];
+}
+
+void Pixels::overlay_pixel(int x, int y, int col, double overlay_opacity_multiplier){
+    set_pixel_carefully(x, y, color_combine(get_pixel_carefully(x, y), col, overlay_opacity_multiplier));
+}
+
+void Pixels::get_pixel_by_channels(int x, int y, int& a, int& r, int& g, int& b) const {
+    int col = get_pixel_carefully(x,y);
+    a=geta(col);
+    r=getr(col);
+    g=getg(col);
+    b=getb(col);
+}
+
+int Pixels::get_alpha(int x, int y) const {
+    return geta(get_pixel_carefully(x,y));
+}
+
+void Pixels::set_pixel_carelessly(int x, int y, int col) {
+    pixels[wh.x*y+x] = col;
+}
+
+void Pixels::set_pixel_carefully(int x, int y, int col) {
+    if(out_of_range(x, y)) return;
+    pixels[wh.x*y+x] = col;
+}
+
+void Pixels::darken(float factor){
+    for(int i = 0; i < wh.x * wh.y; i++){
+        int a = geta(pixels[i]);
+        int r = getr(pixels[i]);
+        int g = getg(pixels[i]);
+        int b = getb(pixels[i]);
+        r = static_cast<int>(r * factor);
+        g = static_cast<int>(g * factor);
+        b = static_cast<int>(b * factor);
+        pixels[i] = argb(a, r, g, b);
+    }
+}
+
+void Pixels::set_alpha(int x, int y, int a) {
+    if(out_of_range(x, y) || a < 0 || a > 255) return;
+    pixels[wh.x*y+x] = (pixels[wh.x*y+x] & 0x00ffffff) | (a << 24);
+}
+
+void Pixels::get_average_color(int x_start, int y_start, int x_end, int y_end,
+                           int &avgA, int &avgR, int &avgG, int &avgB) {
+    long long sumA = 0, sumR = 0, sumG = 0, sumB = 0;
+    int count = 0;
+    
+    // Loop over the rectangular region.
+    for (int y = y_start; y < y_end; ++y) {
+        for (int x = x_start; x < x_end; ++x) {
+            int a_pixel, r_pixel, g_pixel, b_pixel;
+            get_pixel_by_channels(x, y, a_pixel, r_pixel, g_pixel, b_pixel);
+            sumA += a_pixel;
+            sumR += r_pixel;
+            sumG += g_pixel;
+            sumB += b_pixel;
+            ++count;
+        }
+    }
+    
+    if (count > 0) {
+        avgA = static_cast<int>(sumA / count);
+        avgR = static_cast<int>(sumR / count);
+        avgG = static_cast<int>(sumG / count);
+        avgB = static_cast<int>(sumB / count);
+    } else {
+        avgA = avgR = avgG = avgB = 0;
+    }
+}
+
+void Pixels::scale_to_bounding_box(const vec2& box, Pixels &scaled) const {
+    // Calculate the scaling factor based on the bounding box
+    float scale = min(static_cast<float>(box.x) / wh.x, static_cast<float>(box.y) / wh.y);
+
+    // Calculate the new dimensions
+    int new_width = static_cast<int>(wh.x * scale);
+    int new_height = static_cast<int>(wh.y * scale);
+
+    // Scale the image using bicubic interpolation
+    bicubic_scale(new_width, new_height, scaled);
+}
+
+void Pixels::crop(const ivec2& top_left, const ivec2& bottom_right, Pixels &cropped) const {
+    if(top_left.x < 0 || top_left.y < 0 || bottom_right.x > wh.x || bottom_right.y > wh.y || top_left.x >= bottom_right.x || top_left.y >= bottom_right.y)
+        throw runtime_error("Crop dimensions out of range: " + to_string(top_left.x) + "," + to_string(top_left.y) + "," + to_string(bottom_right.x) + "," + to_string(bottom_right.y) + " for image of size " + to_string(wh.x) + "x" + to_string(wh.y));
+    cropped = Pixels(bottom_right - top_left);
+    for(int dx = top_left.x; dx < bottom_right.x; dx++) {
+        int cropped_x = dx - top_left.x;
+        for(int dy = top_left.y; dy < bottom_right.y; dy++)
+            cropped.set_pixel_carelessly(cropped_x, dy - top_left.y, get_pixel_carefully(dx, dy));
+    }
+}
+
+void Pixels::crop_by_alpha(Pixels& cropped) {
+    int min_x = wh.x;
+    int min_y = wh.y;
+    int max_x = -1;
+    int max_y = -1;
+
+    // Find the bounding box of non-zero alpha pixels
+    for (int y = 0; y < wh.y; y++) {
+        for (int x = 0; x < wh.x; x++) {
+            if (get_alpha(x, y) > 0) {
+                min_x = min(min_x, x);
+                min_y = min(min_y, y);
+                max_x = max(max_x, x);
+                max_y = max(max_y, y);
+            }
+        }
+    }
+
+    if(max_x >= min_x && max_y >= min_y) {
+        crop(ivec2(min_x, min_y), ivec2(max_x + 1, max_y + 1), cropped);
+    } else {
+        cropped = Pixels(ivec2(0, 0));
+    }
+}
+
+int Pixels::get_pixel_bilinear(const vec2& pixel) const {
+    int x0 = static_cast<int>(floor(pixel.x));
+    int x1 = x0 + 1;
+    int y0 = static_cast<int>(floor(pixel.y));
+    int y1 = y0 + 1;
+
+    double dx = pixel.x - x0;
+    double dy = pixel.y - y0;
+
+    int c00 = get_pixel_carefully(x0, y0);
+    int c10 = get_pixel_carefully(x1, y0);
+    int c01 = get_pixel_carefully(x0, y1);
+    int c11 = get_pixel_carefully(x1, y1);
+
+    int a00 = geta(c00), r00 = getr(c00), g00 = getg(c00), b00 = getb(c00);
+    int a10 = geta(c10), r10 = getr(c10), g10 = getg(c10), b10 = getb(c10);
+    int a01 = geta(c01), r01 = getr(c01), g01 = getg(c01), b01 = getb(c01);
+    int a11 = geta(c11), r11 = getr(c11), g11 = getg(c11), b11 = getb(c11);
+
+    int a0 = static_cast<int>(a00 * (1 - dx) + a10 * dx);
+    int r0 = static_cast<int>(r00 * (1 - dx) + r10 * dx);
+    int g0 = static_cast<int>(g00 * (1 - dx) + g10 * dx);
+    int b0 = static_cast<int>(b00 * (1 - dx) + b10 * dx);
+
+    int a1 = static_cast<int>(a01 * (1 - dx) + a11 * dx);
+    int r1 = static_cast<int>(r01 * (1 - dx) + r11 * dx);
+    int g1 = static_cast<int>(g01 * (1 - dx) + g11 * dx);
+    int b1 = static_cast<int>(b01 * (1 - dx) + b11 * dx);
+
+    int a = static_cast<int>(a0 * (1 - dy) + a1 * dy);
+    int r = static_cast<int>(r0 * (1 - dy) + r1 * dy);
+    int g = static_cast<int>(g0 * (1 - dy) + g1 * dy);
+    int b = static_cast<int>(b0 * (1 - dy) + b1 * dy);
+    return argb(a, r, g, b);
+}
+
+bool Pixels::is_empty() const {
+    for (int y = 0; y < wh.y; y++) {
+        for (int x = 0; x < wh.x; x++) {
+            if (get_alpha(x, y) != 0) {
+                return false; // Found a pixel with non-zero alpha, so the Pixels is not empty
+            }
+        }
+    }
+    return true; // No pixel with non-zero alpha found, Pixels is empty
+}
+
+void Pixels::overlay_cpu(const Pixels& p, const vec2& center, double overlay_opacity_multiplier){
+    const ivec2 offset = floor(center - p.wh / 2);
+    for(int x = 0; x < p.wh.x; x++){
+        int xpdx = x+offset.x;
+        for(int y = 0; y < p.wh.y; y++){
+            overlay_pixel(xpdx, y+offset.y, p.get_pixel_carefully(x, y), overlay_opacity_multiplier);
+        }
+    }
+}
+
+void Pixels::scale_to_bounding_box(int box_w, int box_h, Pixels &scaled) const {
+    // Calculate the scaling factor based on the bounding box
+    float scale = min(static_cast<float>(box_w) / wh.x, static_cast<float>(box_h) / wh.y);
+
+    // Calculate the new dimensions
+    int new_width = static_cast<int>(wh.x * scale);
+    int new_height = static_cast<int>(wh.y * scale);
+
+    // Scale the image using bicubic interpolation
+    bicubic_scale(new_width, new_height, scaled);
+}
+
+// Use bilinear interpolation to sample from p with rotation, and overlay onto this.
+// dx and dy specify the center of the rotated p in this image.
+void Pixels::overlay_cpu_with_rotation(const Pixels& p, const vec2& offset, double overlay_opacity_multiplier, float angle_radians){
+    float cos_angle = cos(angle_radians);
+    float sin_angle = sin(angle_radians);
+    ivec2 center = p.wh / 2;
+
+    // Find the leftmost, uppermost, rightmost, and bottommost points of the rotated p to determine the bounding box for iteration
+    int left = 0, right = 0, top = 0, bottom = 0;
+    for (int x = 0; x < 2; x++) {
+        for (int y = 0; y < 2; y++) {
+            ivec2 pxpy = ivec2(x,y) * p.wh;
+            ivec2 point = pxpy - center;
+            int rotated_x = static_cast<int>(cos_angle * point.x - sin_angle * point.y);
+            int rotated_y = static_cast<int>(sin_angle * point.x + cos_angle * point.y);
+            left = min(left, rotated_x);
+            right = max(right, rotated_x);
+            top = min(top, rotated_y);
+            bottom = max(bottom, rotated_y);
+        }
+    }
+    left += offset.x;
+    right += offset.x;
+    top += offset.y;
+    bottom += offset.y;
+
+    // Iterate over the bounding box of the rotated pixels
+    for (int y = top; y <= bottom; y++) {
+        for (int x = left; x <= right; x++) {
+            // Calculate the corresponding point in p by applying the inverse rotation
+            int rotated_x = x - offset.x;
+            int rotated_y = y - offset.y;
+            int original_x = static_cast<int>(cos_angle * rotated_x + sin_angle * rotated_y) + center.x;
+            int original_y = static_cast<int>(-sin_angle * rotated_x + cos_angle * rotated_y) + center.y;
+
+            // If the original point is within the bounds of p, overlay it
+            if (!p.out_of_range(original_x, original_y)) {
+                int col = p.get_pixel_bilinear(vec2(original_x, original_y));
+                overlay_pixel(x, y, col, overlay_opacity_multiplier);
+            }
+        }
+    }
+}
+
+void Pixels::overwrite(const Pixels& p, const vec2& top_left){
+    for(int x = 0; x < p.wh.x; x++){
+        int xpdx = x+top_left.x;
+        for(int y = 0; y < p.wh.y; y++){
+            set_pixel_carefully(xpdx, y+top_left.y, p.get_pixel_carefully(x, y));
+        }
+    }
+}
+
+void Pixels::fill_rect(int x, int y, int rw, int rh, int col){
+    if(x < 0) { rw += x; x = 0; }
+    if(y < 0) { rh += y; y = 0; }
+    if(x + rw > wh.x) rw = wh.x - x;
+    if(y + rh > wh.y) rh = wh.y - y;
+    for(int dx = 0; dx < rw; dx++)
+        for(int dy = 0; dy < rh; dy++)
+            set_pixel_carelessly(x+dx, y+dy, col);
+}
+
+void Pixels::fill_circle(const ivec2& center, double r, int col, double opa){
+    fill_ring(center, r, 0, col, opa);
+}
+
+void Pixels::fill_ring(const ivec2& center, double r_outer, double r_inner, int col, double opa){
+    double r_outer_sq = square(r_outer);
+    double r_inner_sq = square(r_inner);
+    for(double dx = -r_outer+1; dx < r_outer; dx++){
+        double sdx = square(dx);
+        for(double dy = -r_outer+1; dy < r_outer; dy++) {
+            double sdy = square(dy);
+            if(sdx+sdy < r_outer_sq && sdx+sdy >= r_inner_sq)
+                overlay_pixel(center.x+dx, center.y+dy, col, opa);
+        }
+    }
+}
+
+void Pixels::fill_ellipse(const ivec2& center, double rw, double rh, int col, double opa){
+    for(double dx = -rw+1; dx < rw; dx++){
+        double sdx = square(dx/rw);
+        for(double dy = -rh+1; dy < rh; dy++)
+            if(sdx+square(dy/rh) < 1)
+                overlay_pixel(center.x+dx, center.y+dy, col, opa);
+    }
+}
+
+void Pixels::bresenham(int x1, int y1, int x2, int y2, int col, float opacity, int thickness) {
+    int dx = abs(x2 - x1);
+    int dy = abs(y2 - y1);
+    if(dx > 10000 || dy > 10000){
+        if (false) {
+            cout << "Bresenham Overflow. Quitting without finishing line." << endl;
+            cout << "x1: " << x1 << endl;
+            cout << "y1: " << y1 << endl;
+            cout << "x2: " << x2 << endl;
+            cout << "y2: " << y2 << endl;
+            cout << "col: " << col << endl;
+            cout << "thickness: " << thickness << endl;
+        }
+        return;
+    }
+
+    int sx = (x1 < x2) ? 1 : -1; // Direction of drawing on x axis
+    int sy = (y1 < y2) ? 1 : -1; // Direction of drawing on y axis
+
+    int err = dx - dy;
+
+    while(true) {
+        overlay_pixel(x1, y1, col, opacity);
+        for(int i = 1; i < thickness; i++){
+            overlay_pixel(x1+i, y1  , col, opacity);
+            overlay_pixel(x1-i, y1  , col, opacity);
+            overlay_pixel(x1  , y1+i, col, opacity);
+            overlay_pixel(x1  , y1-i, col, opacity);
+        }
+
+        // If we've reached the end point, break
+        if (x1 == x2 && y1 == y2) break;
+
+        int e2 = err * 2;
+
+        // Adjust for next point based on the error
+        if (e2 > -dy) {
+            err -= dy;
+            x1 += sx;
+        }
+        if (e2 < dx) {
+            err += dx;
+            y1 += sy;
+        }
+    }
+}
+
+void Pixels::rounded_rect(float x, float y, float rw, float rh, float r, int col){
+    int xplusr = round(x+r);
+    int yplusr = round(y+r);
+    int rwmrt2 = round(rw-r*2);
+    int rhmrt2 = round(rh-r*2);
+    int xprwmr = round(x+rw-r);
+    int yprhmr = round(y+rh-r);
+    fill_rect(xplusr, y, rwmrt2, rh, col);
+    fill_rect(x, yplusr, rw, rhmrt2, col);
+    for(int i = 0; i < 4; i++)
+        fill_ellipse(i%2==0 ? xplusr : xprwmr, i/2==0 ? yplusr : yprhmr, r, r, col);
+}
+
+void Pixels::flood_fill(int x, int y, int color) {
+    int targetColor = get_pixel_carefully(x, y);
+
+    // Check if the target pixel already has the desired color
+    if (targetColor == color)
+        return;
+
+    std::stack<std::pair<int, int>> stack;
+    stack.push({x, y});
+
+    while (!stack.empty()) {
+        auto [curX, curY] = stack.top();
+        stack.pop();
+
+        // Check if current pixel is within the image boundaries
+        if (out_of_range(curX, curY))
+            continue;
+
+        // Check if current pixel is the target color
+        if (get_pixel_carelessly(curX, curY) != targetColor)
+            continue;
+
+        // Update the pixel color
+        set_pixel_carelessly(curX, curY, color);
+
+        // Push neighboring pixels onto the stack
+        stack.push({curX - 1, curY}); // Left
+        stack.push({curX + 1, curY}); // Right
+        stack.push({curX, curY - 1}); // Up
+        stack.push({curX, curY + 1}); // Down
+    }
+}
+
+Pixels Pixels::naive_scale_down(int scale_down_factor) const {
+    Pixels result(wh/scale_down_factor);
+
+    for (int y = 0; y*scale_down_factor < wh.y; y++) {
+        for (int x = 0; x*scale_down_factor < wh.x; x++) {
+            result.set_pixel_carelessly(x, y, get_pixel_carelessly(x*scale_down_factor, y*scale_down_factor));
+        }
+    }
+
+    return result;
+}
+
+void Pixels::rotate_90_inverse(Pixels& rotated) const {
+    rotated = Pixels(wh);
+
+    // Map each pixel to its new location
+    for (int y = 0; y < wh.y; y++) {
+        for (int x = 0; x < wh.x; x++) {
+            rotated.set_pixel_carelessly(y, wh.x-1-x, get_pixel_carelessly(x, y));
+        }
+    }
+}
+
+void Pixels::rotate_90(Pixels& rotated) const {
+    rotated = Pixels(wh);
+
+    // Map each pixel to its new location
+    for (int y = 0; y < wh.y; y++) {
+        for (int x = 0; x < wh.x; x++) {
+            rotated.set_pixel_carelessly(wh.y-1-y, x, get_pixel_carelessly(x, y));
+        }
+    }
+}
+
+void Pixels::bicubic_scale(int new_width, int new_height, Pixels& result) const {
+    result = Pixels(ivec2(new_width, new_height));
+    cuda_bicubic_scale(pixels.data(), wh.x, wh.y, result.pixels.data(), new_width, new_height);
+}
+
+void Pixels::print_to_terminal() {
+    std::ostringstream ss;
+
+    // Print an empty line first.
+    ss << std::endl;
+
+    // Get terminal dimensions.
+    struct winsize wsz;
+    ioctl(STDOUT_FILENO, TIOCGWINSZ, &wsz);
+    const int termWidth = wsz.ws_col;
+    // Note: we are not using termHeight here.
+
+    // Assume a half-block is square
+    const double charAspect = 2.0;
+
+    int outputWidth = min(wh.x, termWidth);
+    double imageAspect = static_cast<double>(wh.x) / wh.y;
+
+    // Determine the effective vertical resolution (in image pixels) that we wish to sample.
+    // We multiply by 2 because each printed line represents two image rows.
+    int sample_height = static_cast<int>(outputWidth / (imageAspect * charAspect) * 2);
+    // Ensure sample_height is even.
+    sample_height -= sample_height % 2;
+    int printedLines = sample_height / 2;
+
+    // For each terminal character cell, we determine the corresponding region in the image.
+    for (int y = 0; y < printedLines; ++y) {
+        for (int x = 0; x < outputWidth; ++x) {
+            // Determine the horizontal region that maps to this terminal column.
+            int x0 = x * wh.x / outputWidth;
+            int x1 = (x + 1) * wh.x / outputWidth;
+
+            // For the top half of the character cell:
+            int top_y0 = (2 * y) * wh.y / sample_height;
+            int top_y1 = (2 * y + 1) * wh.y / sample_height;
+
+            // For the bottom half of the character cell:
+            int bot_y0 = (2 * y + 1) * wh.y / sample_height;
+            int bot_y1 = (2 * y + 2) * wh.y / sample_height;
+
+            int a_top, r_top, g_top, b_top;
+            int a_bot, r_bot, g_bot, b_bot;
+
+            // Supersample (average) over the regions.
+            get_average_color(x0, top_y0, x1, top_y1, a_top, r_top, g_top, b_top);
+            get_average_color(x0, bot_y0, x1, bot_y1, a_bot, r_bot, g_bot, b_bot);
+
+            // Use ANSI true-color escape sequences:
+            //  - Set foreground to the average top color.
+            //  - Set background to the average bottom color.
+            // Then print the Unicode upper half block (▀), which renders the top half in
+            // the foreground color and the bottom half in the background color.
+            ss << "\033[38;2;" << r_top << ";" << g_top << ";" << b_top << "m"
+                 << "\033[48;2;" << r_bot << ";" << g_bot << ";" << b_bot << "m"
+                 << reinterpret_cast<const char*>(u8"\u2580");
+        }
+        // Reset colors at the end of each line.
+        ss << "\033[0m" << std::endl;
+    }
+    // Reset at the end.
+    ss << "\033[0m" << std::endl;
+
+    std::cout << ss.str();
+}
+
+// Free functions implementations
+
+Pixels create_alpha_from_intensities(const vector<vector<unsigned int>>& intensities) {
+    int height = intensities.size();
+    int width = (height > 0) ? intensities[0].size() : 0;
+
+    Pixels result(ivec2(width, height));
+
+    // Find the minimum and maximum intensity values
+    unsigned int minIntensity = numeric_limits<unsigned int>::max();
+    unsigned int maxIntensity = numeric_limits<unsigned int>::min();
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            unsigned int intensity = intensities[y][x];
+            if(intensity < 0) continue;
+            minIntensity = min(minIntensity, intensity);
+            maxIntensity = max(maxIntensity, intensity);
+        }
+    }
+
+    // Calculate the range of intensities
+    int intensityRange = maxIntensity - minIntensity;
+    if (intensityRange == 0) {
+        // Avoid division by zero if all intensities are the same
+        intensityRange = 1;
+    }
+
+    // Set the alpha channel based on normalized intensity values
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            unsigned int intensity = intensities[y][x];
+            // Square it to make it more peaky
+            int normalized_squared_intensity = square(intensity - minIntensity) * 255. / square(intensityRange);
+            result.set_pixel_carefully(x, y, (normalized_squared_intensity << 24) | 0x00FFFFFF); // White color with alpha
+        }
+    }
+
+    return result;
+}
+
+Pixels create_pixels_from_2d_vector(const vector<vector<unsigned int>>& colors, int negative_intensity) {
+    int height = colors.size();
+    int width = (height > 0) ? colors[0].size() : 0;
+
+    Pixels result(ivec2(width, height));
+
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            result.pixels[y+x*width] = colors[y][x];
+        }
+    }
+
+    return result;
+}
+

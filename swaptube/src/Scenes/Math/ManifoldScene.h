@@ -1,0 +1,35 @@
+#pragma once
+
+#include <string>
+#include <unordered_set>
+
+#include "../Common/ThreeDimensionScene.h"
+#include "../../DataObjects/DevicePointer.h"
+#include "../../Host_Device_Shared/ManifoldData.c"
+
+class ManifoldScene : public ThreeDimensionScene {
+private:
+    std::unordered_set<std::string> manifold_names;
+    uint32_t* d_texture_data;
+    int texture_w;
+    int texture_h;
+    DevicePointer distance_buffer; // depth buffer for the manifold raymarch pass
+
+public:
+    ManifoldScene(const vec2& dimensions = vec2(1, 1));
+
+    void add_manifold(const std::string& name,
+                      const std::string& x_eq, const std::string& y_eq, const std::string& z_eq, const std::string& r_eq, const std::string& i_eq,
+                      const std::string& u_min, const std::string& u_max, const std::string& u_steps,
+                      const std::string& v_min, const std::string& v_max, const std::string& v_steps);
+
+    void remove_manifold(const std::string& name);
+
+    void draw() override;
+
+    void change_data() override;
+
+    void set_texture(const Pixels& new_texture);
+
+    ~ManifoldScene();
+};

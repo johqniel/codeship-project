@@ -1,0 +1,2 @@
+/workspace/swaptube/build/CMakeFiles/CheckCUDA/CMakeFiles/edit_cache.dir
+/workspace/swaptube/build/CMakeFiles/CheckCUDA/CMakeFiles/rebuild_cache.dir

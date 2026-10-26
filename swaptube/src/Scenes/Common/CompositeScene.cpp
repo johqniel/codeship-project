@@ -1,0 +1,52 @@
+#include "CompositeScene.h"
+#include <unordered_map>
+#include <stdexcept>
+#include <algorithm>
+#include <string>
+
+extern "C" void cuda_overlay(
+    uint32_t* background, const ivec2& b_wh,
+    const uint32_t* foreground, const ivec2& f_wh,
+    const vec2& center, const float opacity, const float angle);
+
+CompositeScene::CompositeScene(const vec2& dimensions) : SuperScene(dimensions) {}
+
+void CompositeScene::add_scene_fade_in(const TransitionType tt, std::shared_ptr<Scene> sc, const std::string& state_name, const vec2& pos, double opa, bool behind, int insert_position){
+    add_scene(sc, state_name, pos, behind, insert_position);
+    manager.set(state_name + ".opacity", "0");
+    fade_subscene(tt, state_name, opa);
+}
+
+void CompositeScene::add_scene(std::shared_ptr<Scene> sc, const std::string& state_name, const vec2& pos, bool behind, int insert_position){
+    manager.set({
+        {state_name + ".x", std::to_string(pos.x)},
+        {state_name + ".y", std::to_string(pos.y)},
+        {state_name + ".angle", "0"},
+    });
+    add_subscene_check_dupe(state_name, sc, behind, insert_position);
+}
+
+void CompositeScene::slide_subscene(const TransitionType tt, const std::string& name, const vec2& delta){
+    manager.transition(tt, {
+        {name + ".x", manager.get_equation_string(name + ".x") + " " + std::to_string(delta.x) + " +"},
+        {name + ".y", manager.get_equation_string(name + ".y") + " " + std::to_string(delta.y) + " +"},
+    });
+}
+
+void CompositeScene::draw() {
+    ivec2 wh = get_width_height();
+    for (const std::string& name : render_order){
+        double opa = state[name + ".opacity"];
+        if(opa < 0.001) continue;
+        Pixels* p = nullptr;
+        std::shared_ptr<Scene> subscene = subscenes[name];
+        uint32_t* subscene_gpu_pix = subscene->query();
+        const vec2 center(wh * vec2(state[name + ".x"], state[name + ".y"]));
+
+        cuda_overlay(
+            gpu_pix.get_ptr(), wh,
+            subscene_gpu_pix, subscene->get_width_height(),
+            center, opa, state[name + ".angle"]
+        );
+    }
+}

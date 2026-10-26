@@ -1,0 +1,26 @@
+#pragma once
+
+#include "../Scene.h"
+#include <string>
+#include <sstream>
+#include <unordered_set>
+#include <list>
+#include <utility>
+
+using std::string;
+
+string float_to_pretty_string(const float value);
+string truncate_tick(const float value, const bool append_i);
+
+class CoordinateScene : public Scene {
+public:
+    bool complex_plane = false;
+    CoordinateScene(const vec2& dimensions = vec2(1, 1));
+
+    vec2 point_to_pixel(const vec2& p);
+    vec2 pixel_to_point(const vec2& pix);
+
+    void draw() override;
+
+    void draw_one_axis(bool ymode);
+};

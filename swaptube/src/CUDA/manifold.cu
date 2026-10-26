@@ -1,0 +1,133 @@
+// This file renders a specified 3d manifold in CUDA.
+#include <thrust/complex.h>
+#include <cuda_runtime.h>
+#include <cstring>
+#include "color.cuh" // For complex_to_srgb
+#include "common_graphics.cuh"
+#include "edge_detect.cuh"
+#include "../Host_Device_Shared/ManifoldData.c"
+#include "../Host_Device_Shared/vec.h"
+#include "deepcopy_manifold.cuh"
+
+// Kernel
+__global__ void render_manifold_kernel(
+    uint32_t* pixels, const Cuda::ivec2 wh,
+    const Cuda::ManifoldData d_manifold,
+    const Cuda::vec3 camera_pos, const Cuda::quat camera_direction,
+    const float geom_mean_size, const float fov,
+    float* depth_buffer,
+    const float ab_dilation, const float dot_radius,
+    const uint32_t* tex_pixels, const int tex_w, const int tex_h
+) {
+    // Determine u, v from thread indices
+    int u_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int v_idx = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (u_idx >= d_manifold.u_steps || v_idx >= d_manifold.v_steps) return;
+    float u = d_manifold.u_min + (d_manifold.u_max - d_manifold.u_min) * u_idx / (d_manifold.u_steps - 1);
+    float v = d_manifold.v_min + (d_manifold.v_max - d_manifold.v_min) * v_idx / (d_manifold.v_steps - 1);
+
+    float cuda_tags[3] = { u, v, v }; // The two vs here are an evil hack to make this work with GeodesicScene
+                                      // which plots on a manifold the room's x versus its z.
+                                      // So v goes in the z position.
+
+    // Evaluate manifold equations to get 3D point
+    int error = 0;
+    float x = evaluate_resolved_state_equation(d_manifold.x_size, d_manifold.x_eq, cuda_tags, 3, error);
+    float y = evaluate_resolved_state_equation(d_manifold.y_size, d_manifold.y_eq, cuda_tags, 3, error);
+    float z = evaluate_resolved_state_equation(d_manifold.z_size, d_manifold.z_eq, cuda_tags, 3, error);
+
+    // Project 3D point to 2D screen space
+    Cuda::vec3 out = Cuda::coordinate_to_pixel(
+        {x, y, z}, camera_direction, camera_pos, fov, geom_mean_size, wh);
+    if(out.z <= 0) return; // Don't render points behind camera
+
+    uint32_t color = 0;
+
+    if (tex_pixels != nullptr) {
+        // Map u,v into texture coordinates by stretching uv space onto the texture (nearest-neighbor)
+        float u_range = d_manifold.u_max - d_manifold.u_min;
+        float v_range = d_manifold.v_max - d_manifold.v_min;
+        float u_norm = (u - d_manifold.u_min) / u_range;
+        float v_norm = 1 - (v - d_manifold.v_min) / v_range;
+        int tu = (int)(u_norm * tex_w + 0.5f);
+        int tv = (int)(v_norm * tex_h + 0.5f);
+        color = tex_pixels[tv * tex_w + tu];
+    } else {
+        // Evaluate color equations to get color
+        float r = evaluate_resolved_state_equation(d_manifold.r_size, d_manifold.r_eq, cuda_tags, 3, error);
+        float i = evaluate_resolved_state_equation(d_manifold.i_size, d_manifold.i_eq, cuda_tags, 3, error);
+
+        color = complex_to_srgb(thrust::complex<float>(r, i), ab_dilation, dot_radius);
+    }
+
+    out.x = (int)out.x; // Need these to be integers for comparison and indexing
+    out.y = (int)out.y;
+
+    // Depth test and write pixel
+    if (out.x >= 0 && out.x < wh.x && out.y >= 0 && out.y < wh.y) {
+        int pixel_index = out.y * wh.x + out.x;
+        // Atomically test and update depth using atomicCAS on float bit patterns
+        const float eps = 3e-3f; // epsilon to avoid z-fighting
+        unsigned int* depth_ui = (unsigned int*)(depth_buffer + pixel_index);
+        unsigned int old_ui = *depth_ui;
+        for (;;) {
+            float old_f = __int_as_float(old_ui);
+            if (!(out.z < old_f - eps)) break; // no update needed
+            unsigned int new_ui = __float_as_int(out.z);
+            unsigned int prev_ui = atomicCAS(depth_ui, old_ui, new_ui);
+            if (prev_ui == old_ui) {
+                // successfully updated depth, write pixel color
+                pixels[pixel_index] = color;
+                break;
+            }
+            old_ui = prev_ui; // try again with new observed value
+        }
+    }
+}
+
+// Externed entry point
+extern "C" void cuda_render_manifold(
+    uint32_t* d_pixels, const Cuda::ivec2& wh,
+    float* d_depth_buffer,
+    const Cuda::ManifoldData* manifold, const int num_manifolds,
+    const Cuda::vec3& camera_pos, const Cuda::quat& camera_direction,
+    const float geom_mean_size, const float fov,
+    const float ab_dilation, const float dot_radius,
+    const uint32_t* d_tex_pixels, const int tex_w, const int tex_h
+) {
+    // Allocate zeroized depth buffer on device (initialize to large values from host)
+    cudaMemset(d_depth_buffer, 0x7e, wh.x * wh.y * sizeof(float)); // lazy hack to populate "really big floats"
+
+    for(int m = 0; m < num_manifolds; ++m) {
+        Cuda::ManifoldData d_manifold = deepcopy_manifold(manifold[m]);
+
+        dim3 blockSize(16, 16);
+        dim3 gridSize((manifold[m].u_steps + blockSize.x - 1) / blockSize.x, (manifold[m].v_steps + blockSize.y - 1) / blockSize.y);
+        render_manifold_kernel<<<gridSize, blockSize>>>(
+            d_pixels, wh,
+            d_manifold,
+            camera_pos, camera_direction,
+            geom_mean_size, fov,
+            d_depth_buffer,
+            ab_dilation, dot_radius,
+            d_tex_pixels, tex_w, tex_h
+        );
+        cudaDeviceSynchronize();
+
+        free_manifold(d_manifold);
+    }
+
+    cuda_edge_detect(d_pixels, d_depth_buffer, wh, 0xff0000ff);
+}
+
+extern "C" uint32_t* cuda_copy_texture_to_device(const uint32_t* h_tex_pixels, const int tex_w, const int tex_h) {
+    size_t tex_size = (size_t)tex_w * (size_t)tex_h * sizeof(uint32_t);
+    uint32_t* d_tex_pixels;
+    cudaMalloc(&d_tex_pixels, tex_size);
+    cudaMemcpy(d_tex_pixels, h_tex_pixels, tex_size, cudaMemcpyHostToDevice);
+    return d_tex_pixels;
+}
+extern "C" void cuda_free_texture(uint32_t* d_tex_pixels) {
+    cudaFree(d_tex_pixels);
+}

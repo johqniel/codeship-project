@@ -1,0 +1,40 @@
+#include "GlobalState.h"
+#include <stdexcept>
+#include <iostream>
+#include <string>
+
+void print_global_state(){
+    cout << endl << endl << "=====GLOBAL STATE=====" << endl;
+    for(const auto& pair : global_state){
+        cout << pair.first << ": " << pair.second << endl;
+    }
+    cout << "======================" << endl << endl;
+}
+double get_global_state(const string& key){
+    const auto& pair = global_state.find(key);
+    if(pair == global_state.end()){
+        // I used to error on this always. However, there is a general pattern in which
+        // we give some scene "A" the ability to write to global state and give
+        // scene "B"'s state manager a dependency on that variable. Depending on
+        // the order in which the scenes are rendered, we get indeterminate behavior.
+        // We could fix this by enforcing a render order, but I don't think
+        // the complexity is, or ever will be worth it.
+        // This zero-default behavior fixes the problem for the first frame,
+        // after which scene "A" will have published to global state.
+        if (global_state["microblock_fraction"] != 0) {
+            print_global_state();
+            throw runtime_error("global state access failed on element " + key);
+        }
+        return 0;
+    }
+    return pair->second;
+}
+void set_global_state(const string& key, double value){
+    global_state[key] = value;
+}
+bool global_state_exists(const string& key){
+    return global_state.find(key) != global_state.end();
+}
+const unordered_map<string, double>& get_all_global_state(){
+    return global_state;
+}

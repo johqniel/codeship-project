@@ -1,0 +1,21 @@
+#pragma once
+
+#include "../Common/CoordinateScene.h"
+#include <vector>
+#include <string>
+
+class RealFunctionScene : public CoordinateScene {
+public:
+    RealFunctionScene(const vec2& dimensions = vec2(1, 1));
+
+    // Evaluates the function at x by replacing '{a}' with the x-value,
+    // computing the current function and its transitional variant, then smoothing between them.
+    float call_the_function(const float x, const ResolvedStateEquation& re);
+
+    void draw() override;
+
+    void render_functions();
+
+private:
+    std::vector<unsigned int> function_colors = {0xFF0088FF, 0xFFFF0088};
+};

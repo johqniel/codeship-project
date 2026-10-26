@@ -1,0 +1,29 @@
+#pragma once
+
+#include "../Scene.h"
+#include "../../Host_Device_Shared/vec.h"
+#include "../../Host_Device_Shared/ManifoldData.c"
+
+class GeodesicScene : public Scene {
+public:
+    GeodesicScene(const vec2& dimensions = vec2(1, 1));
+
+    void draw_perspective(ResolvedStateEquation& x_eq,
+                          ResolvedStateEquation& y_eq,
+                          ResolvedStateEquation& z_eq,
+                          ResolvedStateEquation& w_eq,
+                          const quat& camera_direction);
+
+    void draw_manifold(ResolvedStateEquation& x_eq,
+                       ResolvedStateEquation& y_eq,
+                       ResolvedStateEquation& z_eq,
+                       ResolvedStateEquation& w_eq,
+                       const quat& fov_quat);
+
+    void draw() override;
+
+    void change_data();
+
+private:
+    DevicePointer distance_buffer;
+};
